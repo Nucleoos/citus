@@ -230,7 +230,7 @@ CONTEXT:  while executing command on localhost:57638
 -- commands with no constraints on the partition key are not supported
 UPDATE limit_orders_mx SET limit_price = 0.00;
 ERROR:  cannot run UPDATE command which targets multiple shards
-HINT:  Consider using an equality filter on partition column "id" to target a single shard. If you'd like to run a multi-shard operation, use master_modify_multiple_shards().
+HINT:  Consider using an equality filter on partition column to target a single shard. If you'd like to run a multi-shard operation, use master_modify_multiple_shards().
 -- attempting to change the partition key is unsupported
 UPDATE limit_orders_mx SET id = 0 WHERE id = 246;
 ERROR:  modifying the partition value of rows is not allowed
@@ -324,7 +324,7 @@ ERROR:  non-IMMUTABLE functions are not allowed in the RETURNING clause
 -- cursors are not supported
 UPDATE limit_orders_mx SET symbol = 'GM' WHERE CURRENT OF cursor_name;
 ERROR:  cannot run UPDATE command which targets multiple shards
-HINT:  Consider using an equality filter on partition column "id" to target a single shard. If you'd like to run a multi-shard operation, use master_modify_multiple_shards().
+HINT:  Consider using an equality filter on partition column to target a single shard. If you'd like to run a multi-shard operation, use master_modify_multiple_shards().
 -- check that multi-row UPDATE/DELETEs with RETURNING work
 INSERT INTO multiple_hash_mx VALUES ('0', '1');
 INSERT INTO multiple_hash_mx VALUES ('0', '2');

@@ -34,9 +34,11 @@ extern MultiPlan * CreateModifyPlan(Query *originalQuery, Query *query,
 extern bool RouterSelectQuery(Query *originalQuery,
 							  RelationRestrictionContext *restrictionContext,
 							  List **placementList, uint64 *anchorShardId,
-							  List **relationShardList, bool replacePrunedQueryWithDummy);
+							  List **relationShardList, bool replacePrunedQueryWithDummy,
+							  DeferredErrorMessage **planningError);
 extern List * IntersectPlacementList(List *lhsPlacementList, List *rhsPlacementList);
-extern DeferredErrorMessage * ModifyQuerySupported(Query *queryTree);
+extern DeferredErrorMessage * ModifyQuerySupported(Query *queryTree, bool
+												   onlySimpleUpdates);
 extern List * ShardIntervalOpExpressions(ShardInterval *shardInterval, Index rteIndex);
 extern RelationRestrictionContext * CopyRelationRestrictionContext(
 	RelationRestrictionContext *oldContext);

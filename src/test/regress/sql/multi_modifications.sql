@@ -429,3 +429,159 @@ INSERT INTO app_analytics_events (app_id, name) VALUES (102, 'Wayz') RETURNING i
 INSERT INTO app_analytics_events (app_id, name) VALUES (103, 'Mynt') RETURNING *;
 
 DROP TABLE app_analytics_events;
+
+-- test UPDATE with subqueries
+CREATE TABLE raw_table (id bigint, value bigint);
+CREATE TABLE summary_table (
+	id bigint,
+	min_value numeric,
+	average_value numeric,
+	count int,
+	uniques int);
+
+SELECT create_distributed_table('raw_table', 'id');
+SELECT create_distributed_table('summary_table', 'id');
+
+INSERT INTO raw_table VALUES (1, 100);
+INSERT INTO raw_table VALUES (1, 200);
+INSERT INTO raw_table VALUES (1, 200);
+INSERT INTO raw_table VALUES (1, 300);
+INSERT INTO raw_table VALUES (2, 400);
+INSERT INTO raw_table VALUES (2, 500);
+
+INSERT INTO summary_table VALUES (1);
+INSERT INTO summary_table VALUES (2);
+
+SELECT * FROM summary_table ORDER BY id;
+
+UPDATE summary_table SET average_value = average_query.average FROM (
+	SELECT avg(value) AS average FROM raw_table WHERE id = 1
+	) average_query
+WHERE id = 1;
+
+SELECT * FROM summary_table ORDER BY id;
+
+-- try different syntax
+UPDATE summary_table SET (min_value, average_value) =
+	(SELECT min(value), avg(value) FROM raw_table WHERE id = 2)
+WHERE id = 2;
+
+SELECT * FROM summary_table ORDER BY id;
+
+UPDATE summary_table SET min_value = 100
+	WHERE id IN (SELECT id FROM raw_table WHERE id = 1 and value > 100) AND id = 1;
+
+SELECT * FROM summary_table ORDER BY id;
+
+-- these should not update anything
+UPDATE summary_table SET average_value = average_query.average FROM (
+	SELECT avg(value) AS average FROM raw_table WHERE id = 1 AND id = 4
+	) average_query
+WHERE id = 1 AND id = 4;
+
+UPDATE summary_table SET average_value = average_query.average FROM (
+	SELECT avg(value) AS average FROM raw_table WHERE id = 1
+	) average_query
+WHERE id = 1 AND id = 4;
+
+SELECT * FROM summary_table ORDER BY id;
+
+-- on PostgreSQL this would update id = 1 with NULL, but we don't do any changes
+UPDATE summary_table SET average_value = average_query.average FROM (
+	SELECT avg(value) AS average FROM raw_table WHERE id = 1 AND id = 4
+	) average_query
+WHERE id = 1;
+
+SELECT * FROM summary_table ORDER BY id;
+
+-- unsupported multi-shard updates
+UPDATE summary_table SET average_value = average_query.average FROM (
+	SELECT avg(value) AS average FROM raw_table) average_query;
+
+UPDATE summary_table SET average_value = average_value + 1 WHERE id =
+  (SELECT id FROM raw_table WHERE value > 100);
+
+-- test complex queries
+UPDATE summary_table
+SET
+       uniques = metrics.expensive_uniques,
+       count = metrics.total_count
+FROM
+		(SELECT
+			id,
+			count(DISTINCT (CASE WHEN value > 100 then value end)) AS expensive_uniques,
+			count(value) AS total_count
+        FROM raw_table
+        WHERE id = 1
+        GROUP BY id) metrics
+WHERE
+   summary_table.id = metrics.id AND
+   summary_table.id = 1;
+
+SELECT * FROM summary_table ORDER BY id;
+
+-- test joins
+UPDATE summary_table SET count = count + 1 FROM raw_table
+	WHERE raw_table.id = summary_table.id AND summary_table.id = 1;
+
+SELECT * FROM summary_table ORDER BY id;
+
+-- test with reference tables
+
+CREATE TABLE reference_raw_table (id bigint, value bigint);
+CREATE TABLE reference_summary_table (
+	id bigint,
+	min_value numeric,
+	average_value numeric,
+	count int,
+	uniques int);
+
+SELECT create_reference_table('reference_raw_table');
+SELECT create_reference_table('reference_summary_table');
+
+INSERT INTO reference_raw_table VALUES (1, 100);
+INSERT INTO reference_raw_table VALUES (1, 200);
+INSERT INTO reference_raw_table VALUES (1, 200);
+INSERT INTO reference_raw_table VALUES (1, 300);
+INSERT INTO reference_raw_table VALUES (2, 400);
+INSERT INTO reference_raw_table VALUES (2, 500);
+
+INSERT INTO reference_summary_table VALUES (1);
+INSERT INTO reference_summary_table VALUES (2);
+
+SELECT * FROM reference_summary_table ORDER BY id;
+
+UPDATE reference_summary_table SET average_value = average_query.average FROM (
+	SELECT avg(value) AS average FROM reference_raw_table WHERE id = 1
+	) average_query
+WHERE id = 1;
+
+UPDATE reference_summary_table SET (min_value, average_value) =
+	(SELECT min(value), avg(value) FROM reference_raw_table WHERE id = 2)
+WHERE id = 2;
+
+SELECT * FROM reference_summary_table ORDER BY id;
+
+-- no need partition colum equalities on reference tables
+UPDATE reference_summary_table SET (count) =
+	(SELECT id AS inner_id FROM reference_raw_table WHERE value = 500)
+WHERE min_value = 400;
+
+SELECT * FROM reference_summary_table ORDER BY id;
+
+-- mixed replication models should error out
+UPDATE summary_table SET average_value = average_query.average FROM (
+	SELECT avg(value) AS average FROM reference_raw_table WHERE id = 1
+	) average_query
+WHERE id = 1;
+
+UPDATE reference_summary_table SET average_value = average_query.average FROM (
+	SELECT avg(value) AS average FROM raw_table WHERE id = 1
+	) average_query
+WHERE id = 1;
+
+DROP TABLE raw_table;
+DROP TABLE summary_table;
+DROP TABLE reference_raw_table;
+DROP TABLE reference_summary_table;
+

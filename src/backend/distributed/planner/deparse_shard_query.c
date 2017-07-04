@@ -90,6 +90,16 @@ RebuildQueryStrings(Query *originalQuery, List *taskList)
 			}
 		}
 
+		/*
+		 * If this is an update query, we need to update shard names for
+		 * possible subquery structures.
+		 */
+		if (query->commandType == CMD_UPDATE)
+		{
+			List *relationShardList = task->relationShardList;
+			UpdateRelationToShardNames((Node *) query, relationShardList);
+		}
+
 		deparse_shard_query(query, relationId, task->anchorShardId,
 							newQueryString);
 

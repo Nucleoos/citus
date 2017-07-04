@@ -112,9 +112,9 @@ static List * QueryRestrictList(Query *query, char partitionMethod);
 static Expr * ExtractInsertPartitionValue(Query *query, Var *partitionColumn);
 static Job * RouterSelectJob(Query *originalQuery,
 							 RelationRestrictionContext *restrictionContext,
-							 bool *queryRoutable);
+							 DeferredErrorMessage **planningError);
 static bool RelationPrunesToMultipleShards(List *relationShardList);
-static List * TargetShardIntervalsForSelect(Query *query,
+static List * TargetShardIntervalsForRouter(Query *query,
 											RelationRestrictionContext *restrictionContext);
 static List * WorkersContainingAllShards(List *prunedShardIntervalsList);
 static bool MultiRouterPlannableQuery(Query *query,
@@ -161,16 +161,28 @@ CreateModifyPlan(Query *originalQuery, Query *query,
 {
 	Job *job = NULL;
 	MultiPlan *multiPlan = CitusMakeNode(MultiPlan);
+	bool onlySimpleUpdates = false;
 
 	multiPlan->operation = query->commandType;
 
-	multiPlan->planningError = ModifyQuerySupported(query);
+	multiPlan->planningError = ModifyQuerySupported(query, onlySimpleUpdates);
 	if (multiPlan->planningError != NULL)
 	{
 		return multiPlan;
 	}
 
-	job = RouterModifyJob(originalQuery, query, &multiPlan->planningError);
+	if (multiPlan->operation == CMD_UPDATE)
+	{
+		RelationRestrictionContext *restrictionContext =
+			plannerRestrictionContext->relationRestrictionContext;
+		job = RouterSelectJob(originalQuery, restrictionContext,
+							  &multiPlan->planningError);
+	}
+	else
+	{
+		job = RouterModifyJob(originalQuery, query, &multiPlan->planningError);
+	}
+
 	if (multiPlan->planningError != NULL)
 	{
 		return multiPlan;
@@ -204,7 +216,6 @@ CreateSingleTaskRouterPlan(Query *originalQuery, Query *query,
 						   RelationRestrictionContext *restrictionContext)
 {
 	Job *job = NULL;
-	bool queryRoutable = false;
 	MultiPlan *multiPlan = CitusMakeNode(MultiPlan);
 
 	multiPlan->operation = query->commandType;
@@ -216,8 +227,8 @@ CreateSingleTaskRouterPlan(Query *originalQuery, Query *query,
 		return multiPlan;
 	}
 
-	job = RouterSelectJob(originalQuery, restrictionContext, &queryRoutable);
-	if (!queryRoutable)
+	job = RouterSelectJob(originalQuery, restrictionContext, &multiPlan->planningError);
+	if (multiPlan->planningError)
 	{
 		/* query cannot be handled by this planner */
 		return NULL;
@@ -455,7 +466,7 @@ ExtractInsertRangeTableEntry(Query *query)
  * features, otherwise it returns an error description.
  */
 DeferredErrorMessage *
-ModifyQuerySupported(Query *queryTree)
+ModifyQuerySupported(Query *queryTree, bool onlySimpleUpdates)
 {
 	Oid distributedTableId = ExtractFirstDistributedTableId(queryTree);
 	uint32 rangeTableId = 1;
@@ -479,9 +490,13 @@ ModifyQuerySupported(Query *queryTree)
 	 */
 	if (queryTree->hasSubLinks == true)
 	{
-		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-							 "subqueries are not supported in distributed modifications",
-							 NULL, NULL);
+		/* we have an exception for UPDATE queries if onlySimpleUpdates is set false */
+		if (commandType != CMD_UPDATE || onlySimpleUpdates)
+		{
+			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+								 "subqueries are not supported in distributed "
+								 "modifications", NULL, NULL);
+		}
 	}
 
 	/* reject queries which include CommonTableExpr */
@@ -542,6 +557,14 @@ ModifyQuerySupported(Query *queryTree)
 		}
 		else
 		{
+			char *rangeTableEntryErrorDetail = NULL;
+
+			/* support updates with subqueries */
+			if (commandType == CMD_UPDATE && !onlySimpleUpdates)
+			{
+				continue;
+			}
+
 			/*
 			 * Error out for rangeTableEntries that we do not support.
 			 * We do not explicitly specify "in FROM clause" in the error detail
@@ -549,7 +572,6 @@ ModifyQuerySupported(Query *queryTree)
 			 * We do not need to check for RTE_CTE because all common table expressions
 			 * are rejected above with queryTree->cteList check.
 			 */
-			char *rangeTableEntryErrorDetail = NULL;
 			if (rangeTableEntry->rtekind == RTE_SUBQUERY)
 			{
 				rangeTableEntryErrorDetail = "Subqueries are not supported in"
@@ -579,18 +601,23 @@ ModifyQuerySupported(Query *queryTree)
 	}
 
 	/*
-	 * Reject queries which involve joins. Note that UPSERTs are exceptional for this case.
-	 * Queries like "INSERT INTO table_name ON CONFLICT DO UPDATE (col) SET other_col = ''"
+	 * Reject queries which involve joins.
+	 * Note that UPSERTs are exceptional for this case. Queries like
+	 * "INSERT INTO table_name ON CONFLICT DO UPDATE (col) SET other_col = ''"
 	 * contains two range table entries, and we have to allow them.
+	 * Note that UPDATEs with subqueries are exceptional.
 	 */
 	if (commandType != CMD_INSERT && queryTableCount != 1)
 	{
-		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-							 "cannot perform distributed planning for the given"
-							 " modification",
-							 "Joins are not supported in distributed "
-							 "modifications.",
-							 NULL);
+		if (commandType != CMD_UPDATE || onlySimpleUpdates)
+		{
+			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+								 "cannot perform distributed planning for the given"
+								 " modification",
+								 "Joins are not supported in distributed "
+								 "modifications.",
+								 NULL);
+		}
 	}
 
 	/* reject queries which involve multi-row inserts */
@@ -1640,52 +1667,90 @@ ExtractInsertPartitionValue(Query *query, Var *partitionColumn)
 /* RouterSelectJob builds a Job to represent a single shard select query */
 static Job *
 RouterSelectJob(Query *originalQuery, RelationRestrictionContext *restrictionContext,
-				bool *returnQueryRoutable)
+				DeferredErrorMessage **planningError)
 {
 	Job *job = NULL;
 	Task *task = NULL;
-	bool queryRoutable = false;
+	bool shardsPresent = false;
 	StringInfo queryString = makeStringInfo();
 	uint64 shardId = INVALID_SHARD_ID;
 	List *placementList = NIL;
 	List *relationShardList = NIL;
 	bool replacePrunedQueryWithDummy = false;
+	bool requiresMasterEvaluation = false;
 
 	/* router planner should create task even if it deosn't hit a shard at all */
 	replacePrunedQueryWithDummy = true;
 
-	queryRoutable = RouterSelectQuery(originalQuery, restrictionContext,
+	/* check if this query requires master evaluation */
+	requiresMasterEvaluation = RequiresMasterEvaluation(originalQuery);
+
+	shardsPresent = RouterSelectQuery(originalQuery, restrictionContext,
 									  &placementList, &shardId, &relationShardList,
-									  replacePrunedQueryWithDummy);
+									  replacePrunedQueryWithDummy, planningError);
 
-
-	if (!queryRoutable)
+	if (*planningError)
 	{
-		*returnQueryRoutable = false;
 		return NULL;
 	}
 
 	job = CreateJob(originalQuery);
 
+	/* If there are no shards, create an empty task list for modifications */
+	if (!shardsPresent && originalQuery->commandType == CMD_UPDATE)
+	{
+		job->taskList = NIL;
+		return job;
+	}
+
 	pg_get_query_def(originalQuery, queryString);
 
-	task = CreateTask(ROUTER_TASK);
+	if (originalQuery->commandType == CMD_UPDATE)
+	{
+		ListCell *relationShardCell = NULL;
+		char replicationModel = REPLICATION_MODEL_INVALID;
+
+		foreach(relationShardCell, relationShardList)
+		{
+			RelationShard *relationShard = (RelationShard *) lfirst(relationShardCell);
+			DistTableCacheEntry *cacheEntry =
+				DistributedTableCacheEntry(relationShard->relationId);
+
+			if (replicationModel == REPLICATION_MODEL_INVALID)
+			{
+				replicationModel = cacheEntry->replicationModel;
+			}
+			else if (replicationModel != cacheEntry->replicationModel)
+			{
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("cannot perform an UPDATE on tables with "
+									   "different replication models")));
+			}
+		}
+
+		task = CreateTask(MODIFY_TASK);
+		task->replicationModel = replicationModel;
+	}
+	else
+	{
+		task = CreateTask(ROUTER_TASK);
+	}
+
 	task->queryString = queryString->data;
 	task->anchorShardId = shardId;
 	task->taskPlacementList = placementList;
 	task->relationShardList = relationShardList;
 
 	job->taskList = list_make1(task);
-
-	*returnQueryRoutable = true;
+	job->requiresMasterEvaluation = requiresMasterEvaluation;
 
 	return job;
 }
 
 
 /*
- * RouterSelectQuery returns true if the input query can be pushed down to the
- * worker node as it is. Otherwise, the function returns false.
+ * RouterSelectQuery returns true if there are shards present after running
+ * pruning logic.
  *
  * On return true, all RTEs have been updated to point to the relevant shards in
  * the originalQuery. Also, placementList is filled with the list of worker nodes
@@ -1697,9 +1762,9 @@ RouterSelectJob(Query *originalQuery, RelationRestrictionContext *restrictionCon
 bool
 RouterSelectQuery(Query *originalQuery, RelationRestrictionContext *restrictionContext,
 				  List **placementList, uint64 *anchorShardId, List **relationShardList,
-				  bool replacePrunedQueryWithDummy)
+				  bool replacePrunedQueryWithDummy, DeferredErrorMessage **planningError)
 {
-	List *prunedRelationShardList = TargetShardIntervalsForSelect(originalQuery,
+	List *prunedRelationShardList = TargetShardIntervalsForRouter(originalQuery,
 																  restrictionContext);
 	uint64 shardId = INVALID_SHARD_ID;
 	CmdType commandType PG_USED_FOR_ASSERTS_ONLY = originalQuery->commandType;
@@ -1709,12 +1774,41 @@ RouterSelectQuery(Query *originalQuery, RelationRestrictionContext *restrictionC
 
 	*placementList = NIL;
 
+	/*
+	 * If prunedRelationShardList is NULL then it means a relation has more
+	 * than one shard left after pruning.
+	 */
 	if (prunedRelationShardList == NULL)
 	{
+		StringInfo errorMessage = makeStringInfo();
+		StringInfo errorHint = makeStringInfo();
+		const char *commandName = NULL;
+
+		if (commandType == CMD_UPDATE)
+		{
+			commandName = "UPDATE";
+		}
+		else
+		{
+			commandName = "DELETE";
+		}
+
+		appendStringInfo(errorHint, "Consider using an equality filter on "
+									"partition column to target a single shard. "
+									"If you'd like to run a multi-shard operation, "
+									"use master_modify_multiple_shards().");
+
+		appendStringInfo(errorMessage,
+						 "cannot run %s command which targets multiple shards",
+						 commandName);
+
+		(*planningError) = DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+										 errorMessage->data, NULL,
+										 errorHint->data);
 		return false;
 	}
 
-	Assert(commandType == CMD_SELECT);
+	Assert(commandType == CMD_SELECT || commandType == CMD_UPDATE);
 
 	foreach(prunedRelationShardListCell, prunedRelationShardList)
 	{
@@ -1726,7 +1820,14 @@ RouterSelectQuery(Query *originalQuery, RelationRestrictionContext *restrictionC
 		/* no shard is present or all shards are pruned out case will be handled later */
 		if (prunedShardList == NIL)
 		{
-			continue;
+			if (commandType == CMD_UPDATE)
+			{
+				return false;
+			}
+			else
+			{
+				continue;
+			}
 		}
 
 		shardsPresent = true;
@@ -1756,6 +1857,9 @@ RouterSelectQuery(Query *originalQuery, RelationRestrictionContext *restrictionC
 	 */
 	if (RelationPrunesToMultipleShards(*relationShardList))
 	{
+		(*planningError) = DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+										 "Relation Prunes To Multiple Shards", NULL,
+										 NULL);
 		return false;
 	}
 
@@ -1798,21 +1902,26 @@ RouterSelectQuery(Query *originalQuery, RelationRestrictionContext *restrictionC
 	if (workerList == NIL)
 	{
 		ereport(DEBUG2, (errmsg("Found no worker with all shard placements")));
-
+		(*planningError) = DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+										 "Found no worker with all shard placements",
+										 NULL, NULL);
 		return false;
 	}
 
-	UpdateRelationToShardNames((Node *) originalQuery, *relationShardList);
+	if (!(RequiresMasterEvaluation(originalQuery) && commandType == CMD_UPDATE))
+	{
+		UpdateRelationToShardNames((Node *) originalQuery, *relationShardList);
+	}
 
 	*placementList = workerList;
 	*anchorShardId = shardId;
 
-	return true;
+	return shardsPresent;
 }
 
 
 /*
- * TargetShardIntervalsForSelect performs shard pruning for all referenced relations
+ * TargetShardIntervalsForRouter performs shard pruning for all referenced relations
  * in the query and returns list of shards per relation. Shard pruning is done based
  * on provided restriction context per relation. The function bails out and returns NULL
  * if any of the relations pruned down to more than one active shard. It also records
@@ -1821,13 +1930,12 @@ RouterSelectQuery(Query *originalQuery, RelationRestrictionContext *restrictionC
  * are treated as if all of the shards of joining relations are pruned out.
  */
 static List *
-TargetShardIntervalsForSelect(Query *query,
+TargetShardIntervalsForRouter(Query *query,
 							  RelationRestrictionContext *restrictionContext)
 {
 	List *prunedRelationShardList = NIL;
 	ListCell *restrictionCell = NULL;
 
-	Assert(query->commandType == CMD_SELECT);
 	Assert(restrictionContext != NULL);
 
 	foreach(restrictionCell, restrictionContext->relationRestrictionList)
@@ -1856,8 +1964,7 @@ TargetShardIntervalsForSelect(Query *query,
 		whereFalseQuery = ContainsFalseClause(pseudoRestrictionList);
 		if (!whereFalseQuery && shardCount > 0)
 		{
-			prunedShardList = PruneShards(relationId, tableId,
-										  restrictClauseList);
+			prunedShardList = PruneShards(relationId, tableId, restrictClauseList);
 
 			/*
 			 * Quick bail out. The query can not be router plannable if one

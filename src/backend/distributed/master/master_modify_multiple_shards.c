@@ -150,7 +150,9 @@ master_modify_multiple_shards(PG_FUNCTION_ARGS)
 
 	if (modifyQuery->commandType != CMD_UTILITY)
 	{
-		DeferredErrorMessage *error = ModifyQuerySupported(modifyQuery);
+		bool onlySimpleUpdates = true;
+		DeferredErrorMessage *error = ModifyQuerySupported(modifyQuery,
+														   onlySimpleUpdates);
 		if (error)
 		{
 			RaiseDeferredError(error, ERROR);
