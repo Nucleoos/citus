@@ -269,7 +269,18 @@ EvaluateNodeIfReferencesFunction(Node *expression, PlanState *planState)
 		}
 	}
 
-	return expression;
+	/* descend into expression tree (e.g. evaluate ARRAY[now(),now()]) */
+	if (IsA(expression, Query))
+	{
+		return (Node *) query_tree_mutator((Query *) expression,
+										   EvaluateNodeIfReferencesFunction,
+										   (void *) planState, 0);
+	}
+	else
+	{
+		return expression_tree_mutator(expression, EvaluateNodeIfReferencesFunction,
+									   (void *) planState);
+	}
 }
 
 
