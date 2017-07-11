@@ -487,3 +487,57 @@ AssignDistributedTransactionId(void)
 
 	SpinLockRelease(&MyBackendData->mutex);
 }
+
+
+/*
+ * LockDistributedTransactionSharedMemory locks the shared memory segment
+ * used to keep distributed transaction information to prevent concurrent
+ * reads (e.g. deadlock detection) and writes (e.g. new backend).
+ */
+void
+LockDistributedTransactionSharedMemory(LWLockMode mode)
+{
+	LWLockAcquire(&backendManagementShmemData->lock, mode);
+}
+
+
+/*
+ * UnlockDistributedTransactionSharedMemory releases the light-weight lock
+ * on the shared memory segment for distributed transaction information.
+ */
+void
+UnlockDistributedTransactionSharedMemory(void)
+{
+	LWLockRelease(&backendManagementShmemData->lock);
+}
+
+
+/*
+ * GetBackendDataForProc returns the distributed transaction data for a given
+ * process, which is initialised to 0 if there is no distributed transaction.
+ * If the process is part of a lock group (parallel query) it returns the
+ * leader data instead.
+ */
+BackendData *
+GetBackendDataForProc(PGPROC *proc)
+{
+	int pgprocno = proc->pgprocno;
+
+	if (proc->lockGroupLeader != NULL)
+	{
+		pgprocno = proc->lockGroupLeader->pgprocno;
+	}
+
+	return &backendManagementShmemData->backends[pgprocno];
+}
+
+
+/*
+ * IsInDistributedTransaction returns whether the given back is in a
+ * distributed transaction.
+ */
+bool
+IsInDistributedTransaction(BackendData *backendData)
+{
+	return backendData->transactionId.transactionNumber != 0;
+}
