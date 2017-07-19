@@ -29,6 +29,7 @@
 #include "commands/defrem.h"
 #include "commands/extension.h"
 #include "commands/trigger.h"
+#include "distributed/citus_ruleutils.h"
 #include "distributed/colocation_utils.h"
 #include "distributed/distribution_column.h"
 #include "distributed/master_metadata_utility.h"
@@ -37,6 +38,7 @@
 #include "distributed/metadata_sync.h"
 #include "distributed/multi_copy.h"
 #include "distributed/multi_logical_planner.h"
+#include "distributed/multi_partitioning_utils.h"
 #include "distributed/multi_utility.h"
 #include "distributed/pg_dist_colocation.h"
 #include "distributed/pg_dist_partition.h"
@@ -128,6 +130,13 @@ master_create_distributed_table(PG_FUNCTION_ARGS)
 								   "master_create_distributed_table."),
 						 errhint("Use create_distributed_table to use the streaming "
 								 "replication model.")));
+	}
+
+	if (PartitionedTable(distributedRelationId))
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("distributing partitioned tables in only supported "
+							   "with create_distributed_table UDF")));
 	}
 
 	ConvertToDistributedTable(distributedRelationId, distributionColumnName,
@@ -350,23 +359,15 @@ ConvertToDistributedTable(Oid relationId, char *distributionColumnName,
 
 	/* verify target relation is either regular or foreign table */
 	relationKind = relation->rd_rel->relkind;
-	if (relationKind != RELKIND_RELATION && relationKind != RELKIND_FOREIGN_TABLE)
+	if (!SupportedRelationKind(relation))
 	{
 		ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE),
-						errmsg("cannot distribute relation: %s",
-							   relationName),
+						errmsg("cannot distribute relation: %s", relationName),
 						errdetail("Distributed relations must be regular or "
 								  "foreign tables.")));
 	}
 
 #if (PG_VERSION_NUM >= 100000)
-	if (relation->rd_rel->relispartition)
-	{
-		ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE),
-						errmsg("cannot distribute relation: %s", relationName),
-						errdetail("Distributing partition tables is unsupported.")));
-	}
-
 	if (RelationUsesIdentityColumns(relationDesc))
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -375,6 +376,39 @@ ConvertToDistributedTable(Oid relationId, char *distributionColumnName,
 								  "... AS IDENTITY.")));
 	}
 #endif
+
+	if (PartitionedTable(relationId))
+	{
+
+		/* distributing partitioned tables in only supported for hash-distribution */
+		if (distributionMethod != DISTRIBUTE_BY_HASH)
+		{
+
+			ereport(ERROR, (errmsg("distributing partitioned tables in only supported "),
+								   "for hash-distributed tables"));
+		}
+
+		/* we cannot distribute tables with multi-level partitioning */
+		if (PartitionTable(relationId))
+		{
+			ereport(ERROR, (errmsg("Citus does not support distributing multi-level "),
+								   "partitioned tables"));
+		}
+	}
+
+	/* partitions cannot be distributed directly */
+	if (PartitionTable(relationId) && !IsDistributedTable(PartitionParentOid(relationId)))
+	{
+		char *relationName = get_rel_name(relationId);
+		char *parentRelationName = get_rel_name(PartitionParentOid(relationId));
+
+		ereport(ERROR, (errmsg("cannot distribute relation \"%s\" which is partition of "
+							   "\"%s\"", relationName, parentRelationName),
+						errdetail("Citus does not support distributing partitions "
+								  "directly."),
+						errhint("Distribute the partitioned table \"%s\" instead",
+								parentRelationName)));
+	}
 
 	/*
 	 * Distribution column returns NULL for reference tables,
@@ -662,7 +696,11 @@ CreateHashDistributedTable(Oid relationId, char *distributionColumnName,
 
 	/* relax empty table requirement for regular (non-foreign) tables */
 	relationKind = get_rel_relkind(relationId);
+#if (PG_VERSION_NUM >= 100000)
+	if (relationKind == RELKIND_RELATION || relationKind == RELKIND_PARTITIONED_TABLE)
+#else
 	if (relationKind == RELKIND_RELATION)
+#endif
 	{
 		EnsureTableNotDistributed(relationId);
 		useExclusiveConnection = IsTransactionBlock() || !LocalTableEmpty(relationId);
@@ -705,6 +743,21 @@ CreateHashDistributedTable(Oid relationId, char *distributionColumnName,
 	if (relationKind == RELKIND_RELATION)
 	{
 		CopyLocalDataIntoShards(relationId);
+	}
+
+	if (PartitionedTable(relationId))
+	{
+		List *partitionList = PartitionList(relationId);
+		ListCell *partitionCell = NULL;
+		char *parentRelationName = get_rel_name(relationId);
+
+		foreach(partitionCell, partitionList)
+		{
+			Oid partitionOid = lfirst_oid(partitionCell);
+			CreateHashDistributedTable(partitionOid, distributionColumnName,
+									   parentRelationName, shardCount,
+									   replicationFactor);
+		}
 	}
 
 	heap_close(pgDistColocation, NoLock);
@@ -901,6 +954,15 @@ CopyLocalDataIntoShards(Oid distributedRelationId)
 
 	/* take an ExclusiveLock to block all operations except SELECT */
 	distributedRelation = heap_open(distributedRelationId, ExclusiveLock);
+
+	/*
+	 * Skip copying data to partitioned tables, we will copy the data from
+	 * partition to partition's shards.
+	 */
+	if(PartitionedTable(distributedRelationId))
+	{
+		return;
+	}
 
 	/*
 	 * All writes have finished, make sure that we can see them by using the

@@ -160,6 +160,26 @@ IsParentTable(Oid relationId)
 
 
 /*
+ * Wrapper around get_partition_parent
+ *
+ * Note: Because this function assumes that the relation whose OID is passed
+ * as an argument will have precisely one parent, it should only be called
+ * when it is known that the relation is a partition.
+ */
+Oid
+PartitionParentOid(Oid partitionOid)
+{
+	Oid partitionParentOid = InvalidOid;
+
+#if (PG_VERSION_NUM >= 100000)
+	partitionParentOid = get_partition_parent(partitionOid);
+#endif
+
+	return partitionParentOid;
+}
+
+
+/*
  * Takes a parent relation and returns Oid list of its partitions. The
  * function errors out if the given relation is not a parent.
  */
