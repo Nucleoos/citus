@@ -12,6 +12,7 @@
 #include "postgres.h"
 
 #include "access/hash.h"
+#include "distributed/colocation_utils.h"
 #include "distributed/connection_management.h"
 #include "distributed/hash_helpers.h"
 #include "distributed/master_protocol.h"
@@ -48,6 +49,10 @@ typedef struct ConnectionReference
 	 */
 	bool hadDML;
 	bool hadDDL;
+
+	/* colocation group of the placement, if any */
+	uint32 colocationGroupId;
+	uint32 representativeValue;
 
 	/* membership in MultiConnection->referencedPlacements */
 	dlist_node connectionNode;
@@ -178,6 +183,7 @@ static ConnectionPlacementHashEntry * FindOrCreatePlacementEntry(
 	ShardPlacement *placement);
 static bool CanUseExistingConnection(uint32 flags, const char *userName,
 									 ConnectionReference *placementConnection);
+static bool AccessedNonColocatedPlacement(MultiConnection *connection, ShardPlacement *placement);
 static void AssociatePlacementWithShard(ConnectionPlacementHashEntry *placementEntry,
 										ShardPlacement *placement);
 static bool CheckShardPlacements(ConnectionShardHashEntry *shardEntry);
@@ -483,13 +489,35 @@ StartPlacementListConnection(uint32 flags, List *placementAccessList,
 		ShardPlacementAccess *placementAccess =
 			(ShardPlacementAccess *) linitial(placementAccessList);
 		ShardPlacement *placement = placementAccess->placement;
+		char *nodeName = placement->nodeName;
+		int nodePort = placement->nodePort;
 
 		/*
 		 * No suitable connection in the placement->connection mapping, get one from
 		 * the node->connection pool.
 		 */
-		chosenConnection = StartNodeConnection(flags, placement->nodeName,
-											   placement->nodePort);
+		chosenConnection = StartNodeConnection(flags, nodeName, nodePort);
+
+		if (flags & CONNECTION_PER_PLACEMENT &&
+			AccessedNonColocatedPlacement(chosenConnection, placement))
+		{
+			/*
+			 * Cached connection accessed a non-co-located placement in the same
+			 * table or co-location group, while the caller asked for a connection
+			 * per placement. Open a new connection instead.
+			 *
+			 * We use this for situations in which we want to use a different
+			 * connection for every placement, such as COPY. If we blindly returned
+			 * a cached conection that already modified a different, non-co-located
+			 * placement B in the same table or in a table with the same co-location
+			 * ID as the current placement, then we'd no longer able to write to
+			 * placement B later in the COPY.
+			 */
+			chosenConnection = StartNodeConnection(flags | FORCE_NEW_CONNECTION, nodeName,
+												   nodePort);
+
+			Assert(!AccessedNonColocatedPlacement(chosenConnection, placement));
+		}
 	}
 
 	/*
@@ -519,7 +547,7 @@ StartPlacementListConnection(uint32 flags, List *placementAccessList,
 			placementConnection->userName = MemoryContextStrdup(TopTransactionContext,
 																userName);
 
-			/* record association with connection, to handle connection closure */
+			/* record association with connection */
 			dlist_push_tail(&chosenConnection->referencedPlacements,
 							&placementConnection->connectionNode);
 		}
@@ -544,6 +572,10 @@ StartPlacementListConnection(uint32 flags, List *placementAccessList,
 
 				Assert(!placementConnection->hadDDL);
 				Assert(!placementConnection->hadDML);
+
+				/* record association with connection */
+				dlist_push_tail(&chosenConnection->referencedPlacements,
+								&placementConnection->connectionNode);
 			}
 
 			/*
@@ -625,11 +657,21 @@ FindOrCreatePlacementEntry(ShardPlacement *placement)
 				void *conRef = MemoryContextAllocZero(TopTransactionContext,
 													  sizeof(ConnectionReference));
 
+				ConnectionReference *connectionReference = (ConnectionReference *) conRef;
+
+				/*
+				 * Store the co-location group information such that we can later
+				 * determine whether a connection accessed non-co-located placements
+				 * of the same co-location group.
+				 */
+				connectionReference->colocationGroupId = placement->colocationGroupId;
+				connectionReference->representativeValue = placement->representativeValue;
+
 				/*
 				 * Create a connection reference that can be used for the entire
 				 * set of co-located placements.
 				 */
-				colocatedEntry->primaryConnection = (ConnectionReference *) conRef;
+				colocatedEntry->primaryConnection = connectionReference;
 
 				colocatedEntry->hasSecondaryConnections = false;
 			}
@@ -691,6 +733,34 @@ CanUseExistingConnection(uint32 flags, const char *userName,
 	{
 		return true;
 	}
+}
+
+
+/*
+ * AccessedNonColocatedPlacement returns true if the connection accessed another
+ * placement in the same colocation group with a different representative value,
+ * meaning it's not strictly colocated.
+ */
+static bool
+AccessedNonColocatedPlacement(MultiConnection *connection, ShardPlacement *placement)
+{
+	dlist_iter placementIter;
+
+	dlist_foreach(placementIter, &connection->referencedPlacements)
+	{
+		ConnectionReference *connectionReference =
+			dlist_container(ConnectionReference, connectionNode, placementIter.cur);
+
+		if (placement->colocationGroupId != INVALID_COLOCATION_ID &&
+			placement->colocationGroupId == connectionReference->colocationGroupId &&
+			placement->representativeValue != connectionReference->representativeValue)
+		{
+			/* non-co-located placements from the same co-location group */
+			return true;
+		}
+	}
+
+	return false;
 }
 
 
