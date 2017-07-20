@@ -290,7 +290,6 @@ pg_get_tableschemadef_string(Oid tableRelationId, bool includeSequenceDefaults)
 	AttrNumber constraintIndex = 0;
 	AttrNumber constraintCount = 0;
 	StringInfoData buffer = { NULL, 0, 0, 0 };
-	bool supportedRelationKind = false;
 
 	/*
 	 * Instead of retrieving values from system catalogs as other functions in
@@ -303,13 +302,7 @@ pg_get_tableschemadef_string(Oid tableRelationId, bool includeSequenceDefaults)
 	relation = relation_open(tableRelationId, AccessShareLock);
 	relationName = generate_relation_name(tableRelationId, NIL);
 
-	supportedRelationKind = SupportedRelationKind(relation);
-	if (!supportedRelationKind)
-	{
-		ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE),
-						errmsg("%s is not a regular, foreign, or partitioned table",
-							   relationName)));
-	}
+	EnsureRelationKindSupported(tableRelationId);
 
 	initStringInfo(&buffer);
 
@@ -490,25 +483,36 @@ pg_get_tableschemadef_string(Oid tableRelationId, bool includeSequenceDefaults)
 
 
 /*
- * SupportedRelationKind returns true if the given relation is supported as a
- * distributed relation.
+ * EnsureRelationKindSupported errors out if the given relation is not supported
+ * as a distributed relation.
  */
-bool
-SupportedRelationKind(Relation relation)
+void
+EnsureRelationKindSupported(Oid relationId)
 {
-	char relationKind = relation->rd_rel->relkind;
-	bool supportedRelationKind = (relationKind == RELKIND_RELATION || relationKind ==
-								  RELKIND_FOREIGN_TABLE);
+	char relationKind = get_rel_relkind(relationId);
+	bool supportedRelationKind = false;
+
 #if (PG_VERSION_NUM >= 100000)
-	supportedRelationKind = supportedRelationKind || relationKind ==
-							RELKIND_PARTITIONED_TABLE;
+	supportedRelationKind = relationKind == RELKIND_RELATION ||
+							relationKind == RELKIND_FOREIGN_TABLE ||
+							relationKind == RELKIND_PARTITIONED_TABLE;
+#else
+	supportedRelationKind = relationKind == RELKIND_RELATION ||
+							relationKind == RELKIND_FOREIGN_TABLE;
 #endif
 
 	/* Citus doesn't support bare inhereted tables (i.e., not a partition or partitioned table) */
-	supportedRelationKind = supportedRelationKind && !(IsChildTable(relation->rd_id) ||
-													   IsParentTable(relation->rd_id));
+	supportedRelationKind = supportedRelationKind && !(IsChildTable(relationId) ||
+													   IsParentTable(relationId));
 
-	return supportedRelationKind;
+	if (!supportedRelationKind)
+	{
+		char *relationName = get_rel_name(relationId);
+
+		ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						errmsg("cannot distribute \"%s\", because it is not regular or "
+							   "foreign table", relationName)));
+	}
 }
 
 

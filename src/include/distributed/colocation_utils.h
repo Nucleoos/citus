@@ -29,9 +29,14 @@ uint32 ColocationId(int shardCount, int replicationFactor, Oid distributionColum
 extern uint32 CreateColocationGroup(int shardCount, int replicationFactor,
 									Oid distributionColumnType);
 extern uint32 GetNextColocationId(void);
+extern void CheckDistributionMethod(Oid sourceRelationId, Oid targetRelationId);
 extern void CheckReplicationModel(Oid sourceRelationId, Oid targetRelationId);
 extern void CheckDistributionColumnType(Oid sourceRelationId, Oid targetRelationId);
 
 extern void DeleteColocationGroupIfNoTablesBelong(uint32 colocationId);
+
+extern uint32 ColocationIdForNewTable(Oid relationId, char *distributionColumnName,
+									  char distributionMethod,
+									  char *colocateWithTableName);
 
 #endif /* COLOCATION_UTILS_H_ */

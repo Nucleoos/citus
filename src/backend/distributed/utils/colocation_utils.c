@@ -26,6 +26,7 @@
 #include "distributed/metadata_sync.h"
 #include "distributed/multi_logical_planner.h"
 #include "distributed/pg_dist_colocation.h"
+#include "distributed/reference_table_utils.h"
 #include "distributed/resource_lock.h"
 #include "distributed/shardinterval_utils.h"
 #include "distributed/worker_protocol.h"
@@ -524,6 +525,33 @@ GetNextColocationId()
 
 
 /*
+ * CheckDistributionMethod checks if given relations are hash distributed tables.
+ */
+void
+CheckDistributionMethod(Oid sourceRelationId, Oid targetRelationId)
+{
+	char sourceDistributionMethod = 0;
+	char targetDistributionMethod = 0;
+
+	sourceDistributionMethod = PartitionMethod(sourceRelationId);
+	targetDistributionMethod = PartitionMethod(targetRelationId);
+
+	if (sourceDistributionMethod != DISTRIBUTE_BY_HASH ||
+		targetDistributionMethod != DISTRIBUTE_BY_HASH)
+	{
+		char *sourceRelationName = get_rel_name(sourceRelationId);
+		char *targetRelationName = get_rel_name(targetRelationId);
+
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot colocate tables \"%s\" and \"%s\"",
+							   sourceRelationName, targetRelationName),
+						errdetail("colocate_with option is only supported "
+								  "for hash distributed tables.")));
+	}
+}
+
+
+/*
  * CheckReplicationModel checks if given relations are from the same
  * replication model. Otherwise, it errors out.
  */
@@ -996,4 +1024,74 @@ DeleteColocationGroup(uint32 colocationId)
 
 	systable_endscan(scanDescriptor);
 	heap_close(pgDistColocation, RowExclusiveLock);
+}
+
+
+uint32
+ColocationIdForNewTable(Oid relationId, char *distributionColumnName,
+						char distributionMethod, char *colocateWithTableName)
+{
+	Relation relation = NULL;
+	Relation pgDistColocation = NULL;
+	uint32 colocationId = INVALID_COLOCATION_ID;
+
+	if (distributionMethod == DISTRIBUTE_BY_APPEND ||
+		distributionMethod == DISTRIBUTE_BY_RANGE)
+	{
+		return colocationId;
+	}
+
+	/* get an access share lock on the relation to prevent DROP TABLE and ALTER TABLE */
+	relation = relation_open(relationId, AccessShareLock);
+
+	/*
+	 * Get an exclusive lock on the colocation system catalog. Therefore, we
+	 * can be sure that there will no modifications on the colocation table
+	 * until this transaction is committed.
+	 */
+	pgDistColocation = heap_open(DistColocationRelationId(), ExclusiveLock);
+
+	if (distributionMethod == DISTRIBUTE_BY_HASH)
+	{
+		AttrNumber columnIndex = get_attnum(relationId, distributionColumnName);
+		Oid distributionColumnType = get_atttype(relationId, columnIndex);
+
+		if (pg_strncasecmp(colocateWithTableName, "default", NAMEDATALEN) == 0)
+		{
+			/* check for default colocation group */
+			colocationId = ColocationId(ShardCount, ShardReplicationFactor,
+										distributionColumnType);
+
+			if (colocationId == INVALID_COLOCATION_ID)
+			{
+				colocationId = CreateColocationGroup(ShardCount, ShardReplicationFactor,
+													 distributionColumnType);
+			}
+		}
+		else if (pg_strncasecmp(colocateWithTableName, "none", NAMEDATALEN) == 0)
+		{
+			colocationId = GetNextColocationId();
+		}
+		else
+		{
+			/* get colocation group of the target table */
+			text *colocateWithTableNameText = cstring_to_text(colocateWithTableName);
+			Oid sourceRelationId = ResolveRelationId(colocateWithTableNameText);
+
+			CheckDistributionMethod(sourceRelationId, relationId);
+			CheckReplicationModel(sourceRelationId, relationId);
+			CheckDistributionColumnType(sourceRelationId, relationId);
+
+			colocationId = TableColocationId(sourceRelationId);
+		}
+	}
+	else if (distributionMethod == DISTRIBUTE_BY_NONE)
+	{
+		colocationId = CreateReferenceTableColocationId();
+	}
+
+	heap_close(pgDistColocation, ExclusiveLock);
+	heap_close(relation, AccessShareLock);
+
+	return colocationId;
 }
