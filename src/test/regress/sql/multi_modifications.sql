@@ -486,7 +486,7 @@ WHERE id = 1 AND id = 4;
 
 SELECT * FROM summary_table ORDER BY id;
 
--- on PostgreSQL this would update id = 1 with NULL, but we don't do any changes
+-- update with NULL value
 UPDATE summary_table SET average_value = average_query.average FROM (
 	SELECT avg(value) AS average FROM raw_table WHERE id = 1 AND id = 4
 	) average_query

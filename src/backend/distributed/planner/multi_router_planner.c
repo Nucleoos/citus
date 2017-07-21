@@ -1679,6 +1679,9 @@ RouterSelectJob(Query *originalQuery, RelationRestrictionContext *restrictionCon
 	List *relationShardList = NIL;
 	bool replacePrunedQueryWithDummy = false;
 	bool requiresMasterEvaluation = false;
+	List *rangeTableList = NIL;
+	ListCell *rangeTableCell = NULL;
+	bool hasNullifiedModification = false;
 
 	/* router planner should create task even if it deosn't hit a shard at all */
 	replacePrunedQueryWithDummy = true;
@@ -1689,7 +1692,6 @@ RouterSelectJob(Query *originalQuery, RelationRestrictionContext *restrictionCon
 	shardsPresent = RouterSelectQuery(originalQuery, restrictionContext,
 									  &placementList, &shardId, &relationShardList,
 									  replacePrunedQueryWithDummy, planningError);
-
 	if (*planningError)
 	{
 		return NULL;
@@ -1697,8 +1699,23 @@ RouterSelectJob(Query *originalQuery, RelationRestrictionContext *restrictionCon
 
 	job = CreateJob(originalQuery);
 
-	/* If there are no shards, create an empty task list for modifications */
-	if (!shardsPresent && originalQuery->commandType == CMD_UPDATE)
+	/* extract range table entries */
+	ExtractRangeTableEntryWalker((Node *) originalQuery, &rangeTableList);
+
+	foreach(rangeTableCell, rangeTableList)
+	{
+		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
+
+		if (rangeTableEntry->rtekind == RTE_SUBQUERY &&
+			!bms_is_empty(rangeTableEntry->updatedCols))
+		{
+			hasNullifiedModification = true;
+			break;
+		}
+	}
+
+	/* If there are no shards for update, create an empty task list for modifications */
+	if (hasNullifiedModification)
 	{
 		job->taskList = NIL;
 		return job;
