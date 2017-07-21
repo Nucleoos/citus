@@ -1672,7 +1672,6 @@ RouterSelectJob(Query *originalQuery, RelationRestrictionContext *restrictionCon
 {
 	Job *job = NULL;
 	Task *task = NULL;
-	bool shardsPresent = false;
 	StringInfo queryString = makeStringInfo();
 	uint64 shardId = INVALID_SHARD_ID;
 	List *placementList = NIL;
@@ -1689,9 +1688,9 @@ RouterSelectJob(Query *originalQuery, RelationRestrictionContext *restrictionCon
 	/* check if this query requires master evaluation */
 	requiresMasterEvaluation = RequiresMasterEvaluation(originalQuery);
 
-	shardsPresent = RouterSelectQuery(originalQuery, restrictionContext,
-									  &placementList, &shardId, &relationShardList,
-									  replacePrunedQueryWithDummy, planningError);
+	RouterSelectQuery(originalQuery, restrictionContext,
+					  &placementList, &shardId, &relationShardList,
+					  replacePrunedQueryWithDummy, planningError);
 	if (*planningError)
 	{
 		return NULL;
