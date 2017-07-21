@@ -494,8 +494,10 @@ ModifyQuerySupported(Query *queryTree, bool onlySimpleUpdates)
 		if (commandType != CMD_UPDATE || onlySimpleUpdates)
 		{
 			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-								 "subqueries are not supported in distributed "
-								 "modifications", NULL, NULL);
+								 "cannot perform distributed planning for the given "
+								 "modifications",
+								 "Subqueries are not supported in distributed "
+								 "modifications.", NULL);
 		}
 	}
 
@@ -601,19 +603,18 @@ ModifyQuerySupported(Query *queryTree, bool onlySimpleUpdates)
 	}
 
 	/*
-	 * Reject queries which involve joins.
-	 * Note that UPSERTs are exceptional for this case. Queries like
-	 * "INSERT INTO table_name ON CONFLICT DO UPDATE (col) SET other_col = ''"
+	 * Reject queries which involve joins. Note that UPSERTs are exceptional for this case.
+	 * Queries like "INSERT INTO table_name ON CONFLICT DO UPDATE (col) SET other_col = ''"
 	 * contains two range table entries, and we have to allow them.
-	 * Note that UPDATEs with subqueries are exceptional.
 	 */
 	if (commandType != CMD_INSERT && queryTableCount != 1)
 	{
+		/* UPDATEs with subqueries are also an exceptional case */
 		if (commandType != CMD_UPDATE || onlySimpleUpdates)
 		{
 			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-								 "cannot perform distributed planning for the given"
-								 " modification",
+								 "cannot perform distributed planning for the given "
+								 "modification",
 								 "Joins are not supported in distributed "
 								 "modifications.",
 								 NULL);
@@ -1820,14 +1821,7 @@ RouterSelectQuery(Query *originalQuery, RelationRestrictionContext *restrictionC
 		/* no shard is present or all shards are pruned out case will be handled later */
 		if (prunedShardList == NIL)
 		{
-			if (commandType == CMD_UPDATE)
-			{
-				return false;
-			}
-			else
-			{
-				continue;
-			}
+			continue;
 		}
 
 		shardsPresent = true;
